@@ -2,9 +2,9 @@ name = "gemini-web2api"
 main = "src/index.ts"
 compatibility_date = "2024-06-05"
 
-# Environment variables that can be overridden via secrets or environment configuration
+# Non-sensitive variables. Sensitive values (API_KEYS, COOKIE, SAPISID) are
+# managed as encrypted Secrets instead, so they are NOT listed here — otherwise
+# `wrangler deploy` would overwrite the secrets with these plaintext values.
+# Set them with:  npx wrangler secret put API_KEYS
 [vars]
 GEMINI_BL = "boq_assistant-bard-web-server_20260525.09_p0"
-API_KEYS = ""
-COOKIE = ""
-SAPISID = ""
