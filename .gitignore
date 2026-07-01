@@ -7,6 +7,12 @@ cookie.json
 .idea
 .DS_Store
 
+# Node dependencies
+node_modules/
+
+# Cloudflare Worker local dev vars
+.dev.vars
+
 # Local virtualenv
 gemini-to-api/
 venv/
