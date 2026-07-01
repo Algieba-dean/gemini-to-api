@@ -26,7 +26,11 @@ npm install
 
 在 `worker/wrangler.toml` 中，我们已经定义了以下变量。您可以根据需要进行配置：
 
-* `API_KEYS`：用于保护您的 API 接口。可以设置为空（无鉴权），也可以设置用逗号分隔的密钥列表（例如 `"sk-key1,sk-key2"`）。
+* `API_KEYS`：用于保护您的 API 接口。可以设置为空（无鉴权），也可以设置用逗号分隔的密钥列表（例如 `"sk-key1,sk-key2"`）。鉴权同时作用于 OpenAI 兼容端点（`/v1/*`）与 Google 原生端点（`/v1beta/*`）。客户端可通过以下任意一种方式传递密钥：
+  * `Authorization: Bearer <key>`（OpenAI 风格）
+  * `x-api-key: <key>`
+  * `x-goog-api-key: <key>`（Google Gemini 风格）
+  * `?key=<key>`（Google Gemini 查询参数）
 * `COOKIE`：（可选）您的 Google Gemini Web 端 Cookie。匿名模式已默认支持 Flash 模型，若要路由到真实的 Gemini Pro 模型，则必须提供付费版（Gemini Advanced）的 Cookie。
 * `SAPISID`：（可选）如果设置了 `COOKIE`，Worker 会尝试自动提取。您也可以在此显式配置。
 

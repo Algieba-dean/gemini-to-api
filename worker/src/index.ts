@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import type { MiddlewareHandler } from 'hono';
 import { cors } from 'hono/cors';
 import { streamText } from 'hono/streaming';
 import {
@@ -52,13 +53,18 @@ const app = new Hono<{ Bindings: Bindings }>();
 // Enable CORS
 app.use('*', cors());
 
-// Authentication middleware for /v1/*
-app.use('/v1/*', async (c, next) => {
+// Authentication middleware. When API_KEYS is empty the API is open (no auth).
+// Accepts the key via any of:
+//   - Authorization: Bearer <key>   (OpenAI style)
+//   - x-api-key: <key>
+//   - x-goog-api-key: <key>         (Google Gemini style)
+//   - ?key=<key>                    (Google Gemini query param)
+const authMiddleware: MiddlewareHandler<{ Bindings: Bindings }> = async (c, next) => {
   const apiKeysStr = c.env.API_KEYS || "";
   if (!apiKeysStr) {
     return await next();
   }
-  const apiKeys = apiKeysStr.split(",").map(k => k.trim()).filter(k => k);
+  const apiKeys = apiKeysStr.split(",").map((k: string) => k.trim()).filter((k: string) => k);
   if (apiKeys.length === 0) {
     return await next();
   }
@@ -68,14 +74,22 @@ app.use('/v1/*', async (c, next) => {
   if (authHeader.startsWith("Bearer ")) {
     key = authHeader.substring(7);
   } else {
-    key = c.req.header("x-api-key") || "";
+    key =
+      c.req.header("x-api-key") ||
+      c.req.header("x-goog-api-key") ||
+      c.req.query("key") ||
+      "";
   }
 
   if (!apiKeys.includes(key)) {
     return c.json({ error: { message: "invalid api key" } }, 401);
   }
   return await next();
-});
+};
+
+// Protect both OpenAI-compatible (/v1/*) and Google-native (/v1beta/*) endpoints.
+app.use('/v1/*', authMiddleware);
+app.use('/v1beta/*', authMiddleware);
 
 // Helper: Resolve model and think override
 function resolveModel(modelName: string) {
