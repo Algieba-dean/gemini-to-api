@@ -194,6 +194,102 @@ docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.js
 
 > **注意**: 如果 Docker 默认 bridge 网络下出现空回复 (`content: null`), 请切换到 host 网络: `docker run --network host ...` 或在 compose 文件中添加 `network_mode: host`. 这是 Gemini 上游拒绝来自 Docker NAT IP 段的请求导致的.
 
+## 生产部署 (Docker + Nginx + TLS)
+
+面向公网的加固部署: 由 Nginx 反向代理终止 TLS 并强制校验 Bearer API Key, 应用本身只监听回环地址。所有配置都通过 `.env` 文件驱动 (不硬编码域名、路径或密钥), 宿主机只需安装 Docker。完整指南见 [`DEPLOY.md`](DEPLOY.md)。
+
+**架构**
+
+- **应用容器** — host 网络, 绑定 `${APP_HOST}:${APP_PORT}` (默认 `127.0.0.1:8081`), 以非 root 用户运行, `api_keys=[]` (内部/回环调用免密)。
+- **Nginx 容器** — host 网络, 在 80/443 终止 TLS, HTTP→HTTPS 跳转, 外部请求必须携带 `Authorization: Bearer ${API_KEY}` (否则 `401`), 并无缓冲透传 SSE 流。
+- **TLS** — 任意证书均可 (Cloudflare Origin 证书或 Let's Encrypt)。
+
+**步骤**
+
+```bash
+# 1. 安装 Docker Engine + compose 插件
+curl -fsSL https://get.docker.com | sh
+systemctl enable --now docker
+
+# 2. 配置 (所有值都在 .env / config.json 中, 均已 gitignore)
+cp .env.example .env
+cp config.example.json config.json
+#   - .env: 设置 SERVER_NAME, CERT_DIR, SSL_CERT_FILE, SSL_CERT_KEY_FILE, API_KEY
+#            生成密钥:  openssl rand -hex 24
+#   - config.json: 将 "host"/"port" 设为 APP_HOST/APP_PORT, 并设置 "api_keys": []
+
+# 3. 将 TLS 证书 + 私钥放入 CERT_DIR
+ls "$CERT_DIR"   # 必须包含 $SSL_CERT_FILE 和 $SSL_CERT_KEY_FILE
+
+# 4. 构建并启动
+docker compose -f docker-compose.prod.yml up -d --build
+
+# 5. (可选) 通过 systemd 定时器启用自动更新 (默认每 30 分钟)
+sudo bash scripts/install-systemd.sh 30min
+```
+
+若前置 Cloudflare (橙云代理), 请将 SSL/TLS 模式设为 **Full (strict)** 并开启 **Always Use HTTPS**。
+
+**验证**
+
+```bash
+# 内部免密 -> 200
+curl http://${APP_HOST}:${APP_PORT}/
+# 外部带 Key -> 200
+curl https://${SERVER_NAME}/v1/models -H "Authorization: Bearer ${API_KEY}"
+# 外部无 Key -> 401
+curl -i https://${SERVER_NAME}/v1/models
+```
+
+**轮换 API Key**: 修改 `.env` 中的 `API_KEY`, 然后重新渲染 Nginx:
+
+```bash
+docker compose -f docker-compose.prod.yml up -d --force-recreate nginx
+```
+
+**自动更新**: `scripts/auto-update.sh` 仅在远端有新提交时执行 `git pull` 并重建; `scripts/install-systemd.sh` 将其接入 systemd 定时器 (日志写入 `.auto-update.log`)。
+
+## Cloudflare Worker 部署
+
+以 Serverless 方式将 gemini-web2api 运行在 Cloudflare Workers 上 — 免费、全球分发、始终在线。Worker 是位于 [`worker/`](worker/) 的 TypeScript/Hono 移植版。完整指南: [`worker/DEPLOY.md`](worker/DEPLOY.md)。
+
+**前置要求**: Cloudflare 账号 + Node.js 18+。
+
+```bash
+cd worker
+npm install                # 安装依赖 (node_modules 已 gitignore)
+
+# 配置密钥/变量 (推荐加密存储敏感信息)
+npx wrangler secret put API_KEYS   # 逗号分隔的密钥, 如 sk-key1,sk-key2
+npx wrangler secret put COOKIE     # 可选: Gemini Advanced cookie, 用于 Pro 路由
+npx wrangler secret put SAPISID    # 可选 (未填时会尝试从 COOKIE 自动提取)
+
+# 登录并部署
+npx wrangler login
+npm run deploy
+```
+
+部署完成后会输出你的域名, 例如 `https://gemini-web2api.<子域名>.workers.dev`。
+
+**API Key 鉴权**: `API_KEYS` 为空时 Worker **完全开放** (免鉴权)。一旦设置, 鉴权将同时作用于
+OpenAI 兼容端点 (`/v1/*`) 与 Google 原生端点 (`/v1beta/*`)。密钥可通过以下任意方式传递:
+
+- `Authorization: Bearer <key>` (OpenAI 风格)
+- `x-api-key: <key>`
+- `x-goog-api-key: <key>` (Google Gemini 风格)
+- `?key=<key>` (Google Gemini 查询参数)
+
+**本地调试**: `npm run dev` 会在 `http://localhost:8787` 启动本地服务。在 `worker/.dev.vars` (已 gitignore) 中写入 `API_KEYS=sk-test` 即可本地测试鉴权。
+
+**验证**
+
+```bash
+# 无 Key -> 401 (在设置了 API_KEYS 时)
+curl -i https://gemini-web2api.<子域名>.workers.dev/v1/models
+# 带 Key -> 200
+curl https://gemini-web2api.<子域名>.workers.dev/v1/models -H "Authorization: Bearer sk-your-key"
+```
+
 ## 代理配置
 
 如果无法直接访问 `gemini.google.com` (连接超时), 需要配置代理:

@@ -194,6 +194,109 @@ Set `"cookie_file": "/app/cookie.txt"` in `config.json`.
 
 > **Note**: If you get empty responses (`content: null`) with Docker's default bridge network, switch to host networking: `docker run --network host ...` or add `network_mode: host` in your compose file. This is caused by Gemini's upstream rejecting requests from certain Docker NAT IP ranges.
 
+## Production Deployment (Docker + Nginx + TLS)
+
+A hardened, internet-facing deployment: an Nginx reverse proxy terminates TLS and
+enforces a Bearer-token API key, proxying to the app which listens only on
+loopback. Everything is driven by a `.env` file (no hardcoded domain, paths, or
+keys), so the host only needs Docker. See [`DEPLOY.md`](DEPLOY.md) for the full guide.
+
+**Architecture**
+
+- **App container** — host networking, binds `${APP_HOST}:${APP_PORT}` (default `127.0.0.1:8081`), runs as a non-root user, `api_keys=[]` (internal/loopback callers need no key).
+- **Nginx container** — host networking, terminates TLS on 80/443, redirects HTTP→HTTPS, requires `Authorization: Bearer ${API_KEY}` for external requests (otherwise `401`), and streams SSE without buffering.
+- **TLS** — any certificate works (Cloudflare Origin Certificate or Let's Encrypt).
+
+**Steps**
+
+```bash
+# 1. Install Docker Engine + compose plugin
+curl -fsSL https://get.docker.com | sh
+systemctl enable --now docker
+
+# 2. Configure (all values live in .env / config.json, both gitignored)
+cp .env.example .env
+cp config.example.json config.json
+#   - .env: set SERVER_NAME, CERT_DIR, SSL_CERT_FILE, SSL_CERT_KEY_FILE, API_KEY
+#            generate a key with:  openssl rand -hex 24
+#   - config.json: set "host"/"port" to APP_HOST/APP_PORT, and "api_keys": []
+
+# 3. Put your TLS cert + key inside CERT_DIR
+ls "$CERT_DIR"   # must contain $SSL_CERT_FILE and $SSL_CERT_KEY_FILE
+
+# 4. Build & start the stack
+docker compose -f docker-compose.prod.yml up -d --build
+
+# 5. (Optional) enable auto-update via a systemd timer (default: every 30min)
+sudo bash scripts/install-systemd.sh 30min
+```
+
+If you front it with Cloudflare (proxied), set SSL/TLS mode to **Full (strict)** and enable **Always Use HTTPS**.
+
+**Verify**
+
+```bash
+# internal, no key -> 200
+curl http://${APP_HOST}:${APP_PORT}/
+# external with key -> 200
+curl https://${SERVER_NAME}/v1/models -H "Authorization: Bearer ${API_KEY}"
+# external without key -> 401
+curl -i https://${SERVER_NAME}/v1/models
+```
+
+**Rotate the API key**: edit `API_KEY` in `.env`, then re-render Nginx:
+
+```bash
+docker compose -f docker-compose.prod.yml up -d --force-recreate nginx
+```
+
+**Auto-update**: `scripts/auto-update.sh` runs `git pull` and rebuilds the stack only when the remote has new commits; `scripts/install-systemd.sh` wires it to a systemd timer (logs to `.auto-update.log`).
+
+## Cloudflare Worker Deployment
+
+Run gemini-web2api serverlessly on Cloudflare Workers — free, globally distributed,
+and always-on. The Worker is a TypeScript/Hono port under [`worker/`](worker/). Full
+guide: [`worker/DEPLOY.md`](worker/DEPLOY.md).
+
+**Prerequisites**: a Cloudflare account and Node.js 18+.
+
+```bash
+cd worker
+npm install                # install dependencies (node_modules is gitignored)
+
+# Configure secrets/vars (recommended: store secrets encrypted)
+npx wrangler secret put API_KEYS   # comma-separated keys, e.g. sk-key1,sk-key2
+npx wrangler secret put COOKIE     # optional: Gemini Advanced cookie for Pro routing
+npx wrangler secret put SAPISID    # optional (auto-extracted from COOKIE if omitted)
+
+# Log in and deploy
+npx wrangler login
+npm run deploy
+```
+
+Deployment prints your URL, e.g. `https://gemini-web2api.<subdomain>.workers.dev`.
+
+**API key auth**: when `API_KEYS` is empty the Worker is **open** (no auth). Once set,
+auth is enforced on both OpenAI-compatible (`/v1/*`) and Google-native (`/v1beta/*`)
+endpoints. The key may be supplied via any of:
+
+- `Authorization: Bearer <key>` (OpenAI style)
+- `x-api-key: <key>`
+- `x-goog-api-key: <key>` (Google Gemini style)
+- `?key=<key>` (Google Gemini query param)
+
+**Local dev**: `npm run dev` starts a local server at `http://localhost:8787`. Put
+`API_KEYS=sk-test` in `worker/.dev.vars` (gitignored) to test auth locally.
+
+**Verify**
+
+```bash
+# without key -> 401 (when API_KEYS is set)
+curl -i https://gemini-web2api.<subdomain>.workers.dev/v1/models
+# with key -> 200
+curl https://gemini-web2api.<subdomain>.workers.dev/v1/models -H "Authorization: Bearer sk-your-key"
+```
+
 ## Proxy
 
 If you cannot access `gemini.google.com` directly (connection timeout), configure a proxy:
