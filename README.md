@@ -13,6 +13,7 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 - **Optional API Keys**: no auth when `api_keys` is empty, OpenAI-style Bearer auth when configured
 - **OpenAI Compatible**: Drop-in replacement for `/v1/chat/completions` and `/v1/models`
 - **Tool Calling**: Full function calling support (OpenAI format)
+- **Structured Output**: `response_format` `json_object` / `json_schema` (and Google `responseMimeType`/`responseSchema`); works with LangChain `with_structured_output`
 - **Multiple Models**: Flash, Flash Thinking (20k+ char output), Pro, Auto, Lite
 - **Thinking Depth**: Adjustable via `@think=N` suffix (0=deepest, 4=shallowest)
 - **Web Search**: Built-in internet access (Gemini's native search)
@@ -366,9 +367,47 @@ resp = client.chat.completions.create(
 )
 ```
 
+## Structured Output
+
+The API honors OpenAI `response_format` on `/v1/chat/completions`:
+
+```python
+from pydantic import BaseModel
+class Person(BaseModel):
+    name: str
+    age: int
+
+# LangChain / LangGraph — default method now works
+structured = llm.with_structured_output(Person)
+print(structured.invoke("Alice is thirty years old."))  # Person(name='Alice', age=30)
+```
+
+```bash
+curl http://localhost:8081/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "gemini-3.5-flash",
+  "response_format": {"type": "json_schema", "json_schema": {"schema": {"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"]}}},
+  "messages": [{"role": "user", "content": "Bob is 45."}]
+}'
+```
+
+- Supports `{"type":"json_object"}` and `{"type":"json_schema", ...}`.
+- Google-native endpoints support `generationConfig.responseMimeType: "application/json"` and `responseSchema`.
+- Implemented via prompt-instruction + robust JSON extraction (strips Markdown fences / surrounding prose), so it is **best-effort** rather than grammar-constrained. For maximum reliability with complex schemas, `with_structured_output(Schema, method="function_calling")` also works.
+
+## Generation Parameters
+
+The `/v1/chat/completions` endpoint honors these OpenAI parameters:
+
+- **`max_tokens` / `max_completion_tokens`**: output is truncated (best-effort, token-based) and `finish_reason` becomes `length`.
+- **`stop`**: string or list; output is cut at the first stop sequence.
+- **`stream_options: {"include_usage": true}`**: a final usage-only chunk is emitted during streaming.
+- **Token usage**: counted with `tiktoken` (`cl100k_base`) when installed, otherwise a ~4 chars/token estimate. Counts are approximate for Gemini.
+
+Sampling params (`temperature`, `top_p`, `seed`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `n`, `logprobs`) are accepted but **ignored** — the Gemini web backend does not expose them.
+
 ## Limitations
 
-- **No image/multimodal input**: Gemini's image upload requires a proprietary streaming RPC protocol (WIZ/ProcessFile) that cannot be replicated in a standard HTTP proxy. Image inputs in messages will be ignored with a note.
+- **No image/multimodal input** (OpenAI path): image upload requires an authenticated Gemini session; the OpenAI `image_url` path currently ignores images. (The Google-native `inlineData` path can upload when a cookie is configured.)
 - **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
 - **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
 - **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
@@ -377,6 +416,7 @@ resp = client.chat.completions.create(
 
 - Python 3.8+
 - `httpx` (`pip install httpx`) — used for streaming requests
+- `tiktoken` (optional) — accurate token usage counting; falls back to an estimate if missing
 - Network access to `gemini.google.com` (proxy/VPN may be needed in some regions)
 
 ## How It Works

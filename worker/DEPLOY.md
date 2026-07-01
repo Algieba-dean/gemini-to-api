@@ -157,7 +157,7 @@ curl https://gemini-web2api.<your-subdomain>.workers.dev/v1/chat/completions \
 ### 3. 支持的端点映射
 
 * **OpenAI 兼容端点**：
-  * `POST /v1/chat/completions` (支持非流式 & 流式)
+  * `POST /v1/chat/completions` (支持非流式 & 流式；支持结构化输出 `response_format`：`json_object` / `json_schema`)
   * `GET /v1/models` (列出所有可用模型)
   * `POST /v1/responses` (Codex CLI 格式兼容接口)
 * **Google Native API 端点 (支持 Gemini CLI)**：

@@ -13,6 +13,7 @@
 - **可选密钥**: `api_keys` 为空时免密, 填入密钥后按 OpenAI Bearer Key 校验
 - **OpenAI 兼容**: 直接替换 `/v1/chat/completions` 和 `/v1/models`
 - **工具调用**: 完整的 Function Calling 支持 (OpenAI 格式)
+- **结构化输出**: 支持 `response_format` 的 `json_object` / `json_schema`(及 Google 的 `responseMimeType`/`responseSchema`);兼容 LangChain `with_structured_output`
 - **多模型**: Flash, Flash Thinking (2万字+输出), Pro, Auto, Lite
 - **思考深度**: 通过 `@think=N` 后缀调节 (0=最深, 4=最浅)
 - **联网搜索**: 内置互联网访问 (Gemini 原生搜索能力)
@@ -341,9 +342,47 @@ python gemini_web2api.py
 
 支持 Clash, V2Ray, Shadowsocks 等任何 HTTP 代理.
 
+## 结构化输出
+
+`/v1/chat/completions` 支持 OpenAI 的 `response_format`:
+
+```python
+from pydantic import BaseModel
+class Person(BaseModel):
+    name: str
+    age: int
+
+# LangChain / LangGraph 默认方式现已可用
+structured = llm.with_structured_output(Person)
+print(structured.invoke("Alice is thirty years old."))  # Person(name='Alice', age=30)
+```
+
+```bash
+curl http://localhost:8081/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "gemini-3.5-flash",
+  "response_format": {"type": "json_schema", "json_schema": {"schema": {"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"]}}},
+  "messages": [{"role": "user", "content": "Bob is 45."}]
+}'
+```
+
+- 支持 `{"type":"json_object"}` 与 `{"type":"json_schema", ...}`。
+- Google 原生端点支持 `generationConfig.responseMimeType: "application/json"` 与 `responseSchema`。
+- 实现方式为**提示指令 + 稳健 JSON 提取**(自动剥离 Markdown 围栏/多余散文),属**尽力而为**而非语法级约束。复杂 schema 追求最高稳定性时,`with_structured_output(Schema, method="function_calling")` 同样可用。
+
+## 生成参数
+
+`/v1/chat/completions` 支持以下 OpenAI 参数:
+
+- **`max_tokens` / `max_completion_tokens`**:按 token 尽力截断输出,`finish_reason` 置为 `length`。
+- **`stop`**:字符串或列表;在首个停止序列处截断输出。
+- **`stream_options: {"include_usage": true}`**:流式结束前额外发送一个仅含 usage 的 chunk。
+- **Token 统计**:安装 `tiktoken`(`cl100k_base`)时精确统计,否则回退到约 4 字符/token 的估算。对 Gemini 而言仍为近似值。
+
+采样类参数(`temperature`、`top_p`、`seed`、`presence_penalty`、`frequency_penalty`、`logit_bias`、`n`、`logprobs`)会被接收但**忽略**——Gemini 网页后端不暴露这些能力。
+
 ## 已知限制
 
-- **不支持图片/多模态输入**: Gemini 的图片上传需要专有的 WIZ streaming RPC 协议 (ProcessFile), 无法在标准 HTTP 代理中实现. 发送图片会被忽略并返回提示.
+- **不支持图片/多模态输入**(OpenAI 路径): 图片上传需要已登录的 Gemini 会话, 当前 OpenAI 的 `image_url` 路径会忽略图片.(配置 cookie 后, Google 原生 `inlineData` 路径可上传.)
 - **Pro/Ultra 非真实路由**: 无付费订阅 cookie 时, `gemini-3.1-pro` 实际路由到 Flash 模型. "Pro" 只是 UI 偏好标签.
 - **单轮对话**: 每次请求是独立对话, 多轮上下文通过在 prompt 中包含历史消息模拟.
 - **频率限制**: Google 可能限制高频请求, server 会自动重试但持续高负载可能被封.

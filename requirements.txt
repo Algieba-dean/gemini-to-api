@@ -1,1 +1,4 @@
 httpx>=0.25
+# Optional: accurate token counting for usage/max_tokens (falls back to a
+# ~4 chars/token estimate if unavailable).
+tiktoken>=0.7

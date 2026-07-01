@@ -51,6 +51,163 @@ def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
     return ""
 
 
+_ENC = None
+_ENC_TRIED = False
+
+
+def _get_enc():
+    """Return a cached tiktoken encoder, or None if tiktoken is unavailable."""
+    global _ENC, _ENC_TRIED
+    if not _ENC_TRIED:
+        _ENC_TRIED = True
+        try:
+            import tiktoken
+            _ENC = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            _ENC = None
+    return _ENC
+
+
+def count_tokens(text: str) -> int:
+    """Count tokens with tiktoken when available, else a ~4 chars/token estimate."""
+    if not text:
+        return 0
+    enc = _get_enc()
+    if enc is not None:
+        try:
+            return len(enc.encode(text))
+        except Exception:
+            pass
+    return max(1, len(text) // 4)
+
+
+def _trim_to_tokens(text: str, max_tokens: int) -> str:
+    """Truncate text to at most max_tokens tokens."""
+    if max_tokens is None or max_tokens < 0:
+        return text
+    enc = _get_enc()
+    if enc is not None:
+        try:
+            toks = enc.encode(text)
+            if len(toks) <= max_tokens:
+                return text
+            return enc.decode(toks[:max_tokens])
+        except Exception:
+            pass
+    budget = max_tokens * 4
+    return text if len(text) <= budget else text[:budget]
+
+
+def apply_stop_and_max(text: str, stop=None, max_tokens=None):
+    """Emulate OpenAI ``stop`` sequences and ``max_tokens`` on a full response.
+
+    Returns (text, finish_reason) where finish_reason is "length" when the
+    output was truncated by max_tokens, otherwise "stop".
+    """
+    finish = "stop"
+    if not text:
+        return text, finish
+    if stop:
+        stops = [stop] if isinstance(stop, str) else list(stop)
+        idxs = [text.find(s) for s in stops if s]
+        idxs = [i for i in idxs if i >= 0]
+        if idxs:
+            text = text[:min(idxs)]
+    if max_tokens is not None and count_tokens(text) > max_tokens:
+        text = _trim_to_tokens(text, max_tokens)
+        finish = "length"
+    return text, finish
+
+
+def build_json_instruction(response_format) -> str:
+    """Build a prompt instruction for OpenAI ``response_format``.
+
+    Supports ``{"type": "json_object"}`` and
+    ``{"type": "json_schema", "json_schema": {"schema": {...}}}``.
+    Returns "" when no JSON output is requested.
+    """
+    if not isinstance(response_format, dict):
+        return ""
+    rf_type = response_format.get("type")
+    if rf_type == "json_object":
+        return (
+            "\n\n# Output Format\n"
+            "Respond with ONLY a single valid JSON value. Do NOT include any "
+            "explanatory text, comments, or Markdown code fences."
+        )
+    if rf_type == "json_schema":
+        js = response_format.get("json_schema") or {}
+        schema = js.get("schema") or js.get("json_schema") or js
+        schema_str = json.dumps(schema, ensure_ascii=False)
+        return (
+            "\n\n# Output Format\n"
+            "Respond with ONLY a single valid JSON value that strictly conforms to "
+            "the following JSON Schema. Do NOT include any explanatory text, "
+            "comments, or Markdown code fences.\n"
+            f"JSON Schema:\n{schema_str}"
+        )
+    return ""
+
+
+def _first_balanced_json(s: str):
+    """Return the first balanced JSON object/array substring, or None."""
+    start = None
+    for i, ch in enumerate(s):
+        if ch in "{[":
+            start = i
+            break
+    if start is None:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+            if depth == 0:
+                candidate = s[start:i + 1]
+                try:
+                    json.loads(candidate)
+                    return candidate
+                except (json.JSONDecodeError, ValueError):
+                    return None
+    return None
+
+
+def extract_json(text: str) -> str:
+    """Extract clean JSON from model output.
+
+    Strips Markdown code fences and surrounding prose, returning the first
+    balanced JSON value. Falls back to the trimmed text when no JSON is found.
+    """
+    if not text:
+        return text
+    s = text.strip()
+    fence = re.match(r"^```(?:json)?\s*\n?(.*?)\n?```$", s, re.DOTALL)
+    if fence:
+        s = fence.group(1).strip()
+    try:
+        json.loads(s)
+        return s
+    except (json.JSONDecodeError, ValueError):
+        pass
+    extracted = _first_balanced_json(s)
+    return extracted if extracted is not None else s
+
+
 def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> tuple:
     """Convert OpenAI messages to (prompt_str, images_list).
 

@@ -91,6 +91,96 @@ const authMiddleware: MiddlewareHandler<{ Bindings: Bindings }> = async (c, next
 app.use('/v1/*', authMiddleware);
 app.use('/v1beta/*', authMiddleware);
 
+// ─── Structured output (response_format) helpers ───────────────────────────
+// Build a prompt instruction for OpenAI response_format (json_object / json_schema).
+function buildJsonInstruction(responseFormat: any): string {
+  if (!responseFormat || typeof responseFormat !== "object") return "";
+  const t = responseFormat.type;
+  if (t === "json_object") {
+    return "\n\n# Output Format\nRespond with ONLY a single valid JSON value. Do NOT include any explanatory text, comments, or Markdown code fences.";
+  }
+  if (t === "json_schema") {
+    const js = responseFormat.json_schema || {};
+    const schema = js.schema || js.json_schema || js;
+    return "\n\n# Output Format\nRespond with ONLY a single valid JSON value that strictly conforms to the following JSON Schema. Do NOT include any explanatory text, comments, or Markdown code fences.\nJSON Schema:\n" + JSON.stringify(schema);
+  }
+  return "";
+}
+
+// Return the first balanced JSON object/array substring, or null.
+function firstBalancedJson(s: string): string | null {
+  let start = -1;
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === "{" || s[i] === "[") { start = i; break; }
+  }
+  if (start === -1) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{" || ch === "[") depth++;
+    else if (ch === "}" || ch === "]") {
+      depth--;
+      if (depth === 0) {
+        const candidate = s.substring(start, i + 1);
+        try { JSON.parse(candidate); return candidate; } catch { return null; }
+      }
+    }
+  }
+  return null;
+}
+
+// Extract clean JSON from model output: strip fences and surrounding prose.
+function extractJson(text: string): string {
+  if (!text) return text;
+  let s = text.trim();
+  const fence = /^```(?:json)?\s*\n?([\s\S]*?)\n?```$/.exec(s);
+  if (fence) s = fence[1].trim();
+  try { JSON.parse(s); return s; } catch { /* not bare JSON */ }
+  const extracted = firstBalancedJson(s);
+  return extracted !== null ? extracted : s;
+}
+
+// ─── Usage / stop / max_tokens helpers ─────────────────────────────────────
+// Approximate token count (~4 chars/token). Workers cannot bundle a full
+// tokenizer cheaply, so usage numbers are estimates.
+function countTokens(text: string): number {
+  if (!text) return 0;
+  return Math.max(1, Math.ceil(text.length / 4));
+}
+
+function trimToTokens(text: string, maxTokens: number): string {
+  const budget = maxTokens * 4;
+  return text.length <= budget ? text : text.substring(0, budget);
+}
+
+// Emulate OpenAI stop sequences + max_tokens on a full response.
+function applyStopAndMax(text: string, stop: any, maxTokens: any): { text: string; finish: string } {
+  let finish = "stop";
+  if (!text) return { text, finish };
+  if (stop) {
+    const stops = Array.isArray(stop) ? stop : [stop];
+    let cut = -1;
+    for (const s of stops) {
+      if (!s) continue;
+      const i = text.indexOf(s);
+      if (i !== -1 && (cut === -1 || i < cut)) cut = i;
+    }
+    if (cut !== -1) text = text.substring(0, cut);
+  }
+  if (maxTokens != null && countTokens(text) > maxTokens) {
+    text = trimToTokens(text, maxTokens);
+    finish = "length";
+  }
+  return { text, finish };
+}
+
 // Helper: Resolve model and think override
 function resolveModel(modelName: string) {
   let name = modelName || DEFAULT_MODEL;
@@ -332,10 +422,25 @@ app.post('/v1/chat/completions', async (c) => {
   }
   const { modelName, mode: modelId, think: thinkMode } = modelRes;
   const tools = req.tools;
-  const prompt = messagesToPrompt(req.messages || [], tools);
+  let prompt = messagesToPrompt(req.messages || [], tools);
   if (!prompt.trim()) {
     return c.json({ error: { message: "empty prompt" } }, 400);
   }
+
+  const jsonInstruction = buildJsonInstruction(req.response_format);
+  const wantJson = jsonInstruction.length > 0;
+  if (wantJson) {
+    prompt += jsonInstruction;
+  }
+
+  const stop = req.stop;
+  const maxTokens = req.max_tokens ?? req.max_completion_tokens;
+  const includeUsage = !!(req.stream_options && req.stream_options.include_usage);
+  const promptTokens = countTokens(prompt);
+  const usageObj = (completion: string) => {
+    const ct = countTokens(completion);
+    return { prompt_tokens: promptTokens, completion_tokens: ct, total_tokens: promptTokens + ct };
+  };
 
   const stream = req.stream === true;
   const cid = `chatcmpl-${crypto.randomUUID().replace(/-/g, '').substring(0, 12)}`;
@@ -355,7 +460,7 @@ app.post('/v1/chat/completions', async (c) => {
   }
 
   // True streaming: forward chunks as they arrive (only if tools are not used, tools need full text parses)
-  if (stream && !tools) {
+  if (stream && !tools && !wantJson) {
     c.header('Content-Type', 'text/event-stream');
     c.header('Cache-Control', 'no-cache');
     c.header('Connection', 'keep-alive');
@@ -373,6 +478,10 @@ app.post('/v1/chat/completions', async (c) => {
       try {
         let buffer = "";
         let prevText = "";
+        let emitted = "";
+        let finishReason = "stop";
+        let stopEmit = false;
+        const stops: string[] = stop ? (Array.isArray(stop) ? stop : [stop]) : [];
 
         while (true) {
           const { done, value } = await reader.read();
@@ -397,8 +506,32 @@ app.post('/v1/chat/completions', async (c) => {
                     for (const t of part[1]) {
                       if (typeof t === "string" && t.length > prevText.length) {
                         const delta = t.substring(prevText.length);
-                        const cleanDelta = cleanGeminiText(delta);
-                        if (cleanDelta) {
+                        prevText = t;
+                        let piece = cleanGeminiText(delta);
+                        if (!piece) continue;
+                        // stop sequences (may straddle the delta boundary)
+                        if (stops.length) {
+                          const combined = emitted + piece;
+                          let cut = -1;
+                          for (const s of stops) {
+                            if (!s) continue;
+                            const i = combined.indexOf(s, Math.max(0, emitted.length - s.length));
+                            if (i !== -1 && (cut === -1 || i < cut)) cut = i;
+                          }
+                          if (cut !== -1) {
+                            piece = cut >= emitted.length ? combined.substring(emitted.length, cut) : "";
+                            finishReason = "stop";
+                            stopEmit = true;
+                          }
+                        }
+                        // max_tokens
+                        if (maxTokens != null && countTokens(emitted + piece) > maxTokens) {
+                          const allowed = maxTokens - countTokens(emitted);
+                          piece = allowed > 0 ? trimToTokens(piece, allowed) : "";
+                          finishReason = "length";
+                          stopEmit = true;
+                        }
+                        if (piece) {
                           const chunk = {
                             id: cid,
                             object: "chat.completion.chunk",
@@ -406,22 +539,26 @@ app.post('/v1/chat/completions', async (c) => {
                             model: modelName,
                             choices: [{
                               index: 0,
-                              delta: { content: cleanDelta },
+                              delta: { content: piece },
                               finish_reason: null
                             }]
                           };
                           await honoStream.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                          emitted += piece;
                         }
-                        prevText = t;
+                        if (stopEmit) break;
                       }
                     }
                   }
+                  if (stopEmit) break;
                 }
               }
             } catch (e) {
               // ignore
             }
+            if (stopEmit) break;
           }
+          if (stopEmit) break;
         }
 
         // Final Stop Chunk
@@ -433,10 +570,21 @@ app.post('/v1/chat/completions', async (c) => {
           choices: [{
             index: 0,
             delta: {},
-            finish_reason: "stop"
+            finish_reason: finishReason
           }]
         };
         await honoStream.write(`data: ${JSON.stringify(stopChunk)}\n\n`);
+        if (includeUsage) {
+          const usageChunk = {
+            id: cid,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: modelName,
+            choices: [],
+            usage: usageObj(emitted)
+          };
+          await honoStream.write(`data: ${JSON.stringify(usageChunk)}\n\n`);
+        }
         await honoStream.write("data: [DONE]\n\n");
       } catch (err: any) {
         const errChunk = {
@@ -467,12 +615,21 @@ app.post('/v1/chat/completions', async (c) => {
       cleanText = parsed.cleanText;
       toolCalls = parsed.toolCalls;
     }
+    if (wantJson && !toolCalls && cleanText) {
+      cleanText = extractJson(cleanText);
+    }
+
+    let finish = toolCalls ? "tool_calls" : "stop";
+    if (!toolCalls) {
+      const capped = applyStopAndMax(cleanText, stop, maxTokens);
+      cleanText = capped.text;
+      finish = capped.finish;
+    }
 
     const msg: any = { role: "assistant", content: cleanText || null };
     if (toolCalls) {
       msg.tool_calls = toolCalls;
     }
-    const finish = toolCalls ? "tool_calls" : "stop";
 
     if (stream) {
       // Tools stream: return a single event stream block
@@ -488,6 +645,17 @@ app.post('/v1/chat/completions', async (c) => {
           choices: [{ index: 0, delta: msg, finish_reason: finish }]
         };
         await honoStream.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        if (includeUsage) {
+          const usageChunk = {
+            id: cid,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: modelName,
+            choices: [],
+            usage: usageObj(cleanText || "")
+          };
+          await honoStream.write(`data: ${JSON.stringify(usageChunk)}\n\n`);
+        }
         await honoStream.write("data: [DONE]\n\n");
       });
     }
@@ -498,11 +666,7 @@ app.post('/v1/chat/completions', async (c) => {
       created: Math.floor(Date.now() / 1000),
       model: modelName,
       choices: [{ index: 0, message: msg, finish_reason: finish }],
-      usage: {
-        prompt_tokens: Math.floor(prompt.length / 4),
-        completion_tokens: Math.floor(text.length / 4),
-        total_tokens: Math.floor((prompt.length + text.length) / 4)
-      }
+      usage: usageObj(cleanText || "")
     });
   } catch (err: any) {
     return c.json({ error: { message: `upstream error: ${err.message}` } }, 502);
@@ -733,9 +897,17 @@ app.post('/v1beta/models/:modelAndMethod', async (c) => {
   const { modelName, mode: modelId, think: thinkMode } = modelRes;
 
   const req = await c.req.json();
-  const prompt = googleContentsToPrompt(req);
+  let prompt = googleContentsToPrompt(req);
   if (!prompt.trim()) {
     return c.json({ error: { message: "empty content" } }, 400);
+  }
+
+  const genConfig = req.generationConfig || {};
+  const wantJson = genConfig.responseMimeType === "application/json";
+  if (wantJson) {
+    const schema = genConfig.responseSchema;
+    const rf = schema ? { type: "json_schema", json_schema: { schema } } : { type: "json_object" };
+    prompt += buildJsonInstruction(rf);
   }
 
   const payload = buildGeminiPayload(prompt, modelId, thinkMode);
@@ -754,7 +926,8 @@ app.post('/v1beta/models/:modelAndMethod', async (c) => {
 
   try {
     const raw = await response.text();
-    const text = extractResponseText(raw);
+    const rawText = extractResponseText(raw);
+    const text = wantJson ? extractJson(rawText) : rawText;
 
     const candidate = {
       content: { parts: [{ text: text || "" }], role: "model" },

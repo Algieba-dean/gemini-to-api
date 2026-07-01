@@ -9,7 +9,7 @@ from socketserver import ThreadingMixIn
 from .config import CONFIG
 from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
-from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
+from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls, build_json_instruction, extract_json, count_tokens, apply_stop_and_max, _trim_to_tokens
 from .multimodal import upload_image, fetch_image_bytes
 from . import __version__
 
@@ -151,20 +151,66 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
 
+        json_instruction = build_json_instruction(req.get("response_format"))
+        want_json = bool(json_instruction)
+        if want_json:
+            prompt += json_instruction
+
+        stop = req.get("stop")
+        max_tokens = req.get("max_tokens") or req.get("max_completion_tokens")
+        include_usage = bool((req.get("stream_options") or {}).get("include_usage"))
+        prompt_tokens = count_tokens(prompt)
+
+        def usage_obj(completion_text):
+            ct = count_tokens(completion_text)
+            return {"prompt_tokens": prompt_tokens, "completion_tokens": ct,
+                    "total_tokens": prompt_tokens + ct}
+
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
-        if stream and (not tools or tool_choice == "none"):
+        if stream and (not tools or tool_choice == "none") and not want_json:
             try:
                 self._start_sse()
+                stops = ([stop] if isinstance(stop, str) else list(stop)) if stop else []
+                emitted = ""
+                finish = "stop"
                 for delta in generate_stream(prompt, model_id, think_mode, _upload_images(images), extra_fields):
-                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                             "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
-                    self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
-                    self.wfile.flush()
+                    if not delta:
+                        continue
+                    piece = delta
+                    stopped = False
+                    if stops:
+                        combined = emitted + piece
+                        cut = -1
+                        for s in stops:
+                            i = combined.find(s, max(0, len(emitted) - len(s)))
+                            if i != -1 and (cut == -1 or i < cut):
+                                cut = i
+                        if cut != -1:
+                            piece = combined[len(emitted):cut] if cut >= len(emitted) else ""
+                            finish = "stop"
+                            stopped = True
+                    if max_tokens is not None and count_tokens(emitted + piece) > max_tokens:
+                        allowed = max_tokens - count_tokens(emitted)
+                        piece = _trim_to_tokens(piece, allowed) if allowed > 0 else ""
+                        finish = "length"
+                        stopped = True
+                    if piece:
+                        chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                                 "model": model_name, "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]}
+                        self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                        self.wfile.flush()
+                        emitted += piece
+                    if stopped:
+                        break
                 end = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                       "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                       "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}
                 self.wfile.write(f"data: {json.dumps(end)}\n\n".encode())
+                if include_usage:
+                    u = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                         "model": model_name, "choices": [], "usage": usage_obj(emitted)}
+                    self.wfile.write(f"data: {json.dumps(u)}\n\n".encode())
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
@@ -180,16 +226,25 @@ class GeminiHandler(BaseHTTPRequestHandler):
         tool_calls = None
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
+        if want_json and not tool_calls and text:
+            text = extract_json(text)
+        if tool_calls:
+            finish = "tool_calls"
+        else:
+            text, finish = apply_stop_and_max(text, stop, max_tokens)
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg["tool_calls"] = tool_calls
-        finish = "tool_calls" if tool_calls else "stop"
 
         if stream:
             self._start_sse()
             chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                      "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
             self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+            if include_usage:
+                u = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                     "model": model_name, "choices": [], "usage": usage_obj(text or "")}
+                self.wfile.write(f"data: {json.dumps(u)}\n\n".encode())
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         else:
@@ -197,8 +252,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 "id": cid, "object": "chat.completion", "created": int(time.time()),
                 "model": model_name,
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-                "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text or "")//4,
-                          "total_tokens": (len(prompt)+len(text or ""))//4},
+                "usage": usage_obj(text or ""),
             })
 
     # ─── /v1/responses (Codex CLI) ───────────────────────────────────────────
@@ -330,10 +384,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty content"}}, 400)
             return
 
+        gen_config = req.get("generationConfig", {}) or {}
+        want_json = gen_config.get("responseMimeType") == "application/json"
+        if want_json and not has_tools:
+            schema = gen_config.get("responseSchema")
+            rf = {"type": "json_schema", "json_schema": {"schema": schema}} if schema else {"type": "json_object"}
+            prompt += build_json_instruction(rf)
+
         file_refs = _upload_images(images)
         log(f"Google API: model={model_name} stream={stream} tools={has_tools} prompt_len={len(prompt)}")
 
-        if stream and not has_tools:
+        if stream and not has_tools and not want_json:
             try:
                 self._start_sse()
                 full_text = ""
@@ -370,6 +431,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if not text:
             log("Warning: empty response from Gemini")
+
+        if want_json and not has_tools and text:
+            text = extract_json(text)
 
         response_parts = []
         if has_tools and text:
