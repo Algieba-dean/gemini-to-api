@@ -297,6 +297,36 @@ curl -i https://gemini-web2api.<subdomain>.workers.dev/v1/models
 curl https://gemini-web2api.<subdomain>.workers.dev/v1/models -H "Authorization: Bearer sk-your-key"
 ```
 
+### Automated Git Deployment (Cloudflare Workers Builds)
+
+Instead of running `npm run deploy` manually, connect your GitHub repo so every
+`git push` to the production branch (`main`) **auto-builds and deploys**.
+
+**Connect**: Cloudflare dashboard → **Workers & Pages** → your Worker → **Settings → Build → Connect** → authorize GitHub and pick the repo + production branch.
+
+**Build configuration** (this repo keeps the Worker in a `worker/` subdirectory, so commands must `cd worker` first):
+
+| Field | Value |
+|-------|-------|
+| Root directory | `/` |
+| Build command | `cd worker && npm install` |
+| Deploy command | `cd worker && npx wrangler deploy` |
+| Version command | `cd worker && npx wrangler versions upload` |
+
+> The **Version command** (used for non-production/preview branches) also needs the `cd worker &&` prefix — without it, wrangler can't find `wrangler.toml` at the repo root and the build fails. Alternatively, set **Root directory** to `worker` and drop the `cd worker &&` prefix from all three commands.
+
+> **⚠️ Secrets must not live in `[vars]`**: auto-deploy runs `wrangler deploy` on every push, and `wrangler deploy` overwrites same-named variables with the values in `wrangler.toml`. If `API_KEYS` stayed in `[vars]` (even as `""`), each push would **wipe the encrypted secret** you set in the dashboard. This repo therefore keeps only the non-sensitive `GEMINI_BL` in `[vars]`; `API_KEYS`/`COOKIE`/`SAPISID` are managed as **encrypted Secrets**, which persist across CI deploys.
+
+**Set the token via dashboard** (once; CI does not create secrets): **Settings → Variables and Secrets** → edit the existing `API_KEYS` (or **Add** a new **Secret**) → enter the token → **Encrypt** → **Save/Deploy**.
+
+**Verify after the CI build finishes**:
+
+```bash
+curl -i https://<your-domain>/v1/models        # no key  -> 401
+curl -i https://<your-domain>/v1beta/models     # no key  -> 401 (proves the latest code with /v1beta protection is deployed)
+curl https://<your-domain>/v1/models -H "Authorization: Bearer sk-your-key"   # -> 200
+```
+
 ## Proxy
 
 If you cannot access `gemini.google.com` directly (connection timeout), configure a proxy:

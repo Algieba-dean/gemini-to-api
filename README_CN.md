@@ -290,6 +290,35 @@ curl -i https://gemini-web2api.<子域名>.workers.dev/v1/models
 curl https://gemini-web2api.<子域名>.workers.dev/v1/models -H "Authorization: Bearer sk-your-key"
 ```
 
+### Git 自动部署 (Cloudflare Workers Builds)
+
+除了手动 `npm run deploy`, 还可连接 GitHub 仓库实现**自动构建部署**: 每次 `git push` 到生产分支 (`main`) 都会**自动触发构建 + 部署**, 无需本地操作。
+
+**连接**: Cloudflare 后台 → **Workers & Pages** → 你的 Worker → **Settings → Build → Connect** → 授权 GitHub 并选择仓库与生产分支。
+
+**构建配置** (本仓库把 Worker 放在 `worker/` 子目录, `wrangler.toml` 在其中, 所以命令都要先 `cd worker`):
+
+| 配置项 | 值 |
+|--------|-----|
+| 根目录 (Root directory) | `/` |
+| 构建命令 (Build command) | `cd worker && npm install` |
+| 部署命令 (Deploy command) | `cd worker && npx wrangler deploy` |
+| 版本命令 (Version command) | `cd worker && npx wrangler versions upload` |
+
+> **版本命令**(用于非生产/预览分支)同样必须带 `cd worker &&` 前缀, 否则从仓库根目录找不到 `wrangler.toml`, 构建会失败。或者把**根目录**直接设为 `worker`, 三条命令都去掉 `cd worker &&` 前缀。
+
+> **⚠️ 机密不要写进 `[vars]`**: 自动部署意味着每次 push 都会执行 `wrangler deploy`, 而它会用 `wrangler.toml` 中 `[vars]` 的值覆盖同名变量。若 `API_KEYS` 留在 `[vars]` 里(哪怕是 `""`), 每次 push 都会**清空你在网页端设置的加密机密**! 因此本仓库 `[vars]` 只保留非敏感的 `GEMINI_BL`, 而 `API_KEYS`/`COOKIE`/`SAPISID` 作为**加密 Secret** 管理, 可跨 CI 部署持久保留。
+
+**在网页端设置 Token** (只需一次, CI 不会自动创建机密): **Settings → Variables and Secrets** → 编辑已存在的 `API_KEYS` (或 **Add** 新建 **Secret**) → 填入 token → 点 **Encrypt** 加密 → **Save/Deploy**。
+
+**CI 构建完成后验证**:
+
+```bash
+curl -i https://<你的域名>/v1/models        # 无 Key  -> 401
+curl -i https://<你的域名>/v1beta/models     # 无 Key  -> 401 (说明含 /v1beta 保护的最新代码已部署)
+curl https://<你的域名>/v1/models -H "Authorization: Bearer sk-your-key"   # -> 200
+```
+
 ## 代理配置
 
 如果无法直接访问 `gemini.google.com` (连接超时), 需要配置代理:
