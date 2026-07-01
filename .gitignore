@@ -6,3 +6,12 @@ cookie.json
 .env
 .idea
 .DS_Store
+
+# Local virtualenv
+gemini-to-api/
+venv/
+.venv/
+
+# Deployment secrets / local artifacts
+nginx/ssl/
+.auto-update.log

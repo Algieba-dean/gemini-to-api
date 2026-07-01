@@ -1,0 +1,23 @@
+services:
+  gemini-web2api:
+    build: .
+    container_name: gemini-web2api
+    network_mode: host
+    volumes:
+      - ./config.json:/app/config.json:ro
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:stable
+    container_name: gemini-nginx
+    network_mode: host
+    depends_on:
+      - gemini-web2api
+    env_file: .env
+    environment:
+      # Only substitute our own placeholders; keep Nginx runtime vars ($host, $ok, ...) intact.
+      NGINX_ENVSUBST_FILTER: "^(API_KEY|SERVER_NAME|SSL_CERT_FILE|SSL_CERT_KEY_FILE|APP_HOST|APP_PORT)$$"
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - ${CERT_DIR:-./nginx/ssl}:/etc/nginx/ssl:ro
+    restart: unless-stopped

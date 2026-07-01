@@ -1,0 +1,53 @@
+# Nginx reverse proxy for gemini-web2api.
+#
+# This is an Nginx image template: ${VAR} placeholders are substituted from the
+# environment at container start (see docker-compose.prod.yml / .env). Runtime
+# Nginx variables such as $host, $ok, $remote_addr are preserved via
+# NGINX_ENVSUBST_FILTER and must NOT be listed as environment variables.
+
+map_hash_bucket_size 128;
+
+# External auth gate: only requests with the correct Bearer key set $ok=1.
+map $http_authorization $ok {
+    default 0;
+    "Bearer ${API_KEY}" 1;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${SERVER_NAME};
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name ${SERVER_NAME};
+
+    ssl_certificate     /etc/nginx/ssl/${SSL_CERT_FILE};
+    ssl_certificate_key /etc/nginx/ssl/${SSL_CERT_KEY_FILE};
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    # Reject external requests without a valid Bearer key.
+    if ($ok = 0) {
+        return 401;
+    }
+
+    location / {
+        proxy_pass http://${APP_HOST}:${APP_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Streaming (SSE) support: disable buffering, keep connection open.
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 300s;
+        chunked_transfer_encoding on;
+    }
+}
